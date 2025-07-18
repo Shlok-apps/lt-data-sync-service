@@ -1,0 +1,5 @@
+flask
+requests
+pytz
+psycopg2
+schedule
