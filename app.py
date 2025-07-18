@@ -20,6 +20,8 @@ WEB_VALID_API_KEY = "d9f3abcb7f2641ac8e1c90cfa44c2f298f25a7be3341a49c882204b5638
 # LOCAL INSERT TASK/INSPECTION API CONIFGURATION
 LOCAL_TASK_API = f"http://localhost:{PORT}/insertTaskDetailsBulk"
 LOCAL_INSPECTION_API = f"http://localhost:{PORT}/insertInspectionDetailsBulk"
+LOCAL_PRELOAD_TASK_API = f"http://localhost:{PORT}/insertPreLoadTaskDetailsBulk"
+LOCAL_PRELOAD_INSPECTION_API = f"http://localhost:{PORT}/insertPreLoadInspectionDetailsBulk"
 LOCAL_USER_API = f"http://localhost:{PORT}/insertUserDetailsBulk"
 LOCAL_ENTITY_API = f"http://localhost:{PORT}/insertEntityDetailsBulk"
 
@@ -27,8 +29,9 @@ LOCAL_ENTITY_API = f"http://localhost:{PORT}/insertEntityDetailsBulk"
 CRON_TIME_IN_SECONDS = 60 # 60 MEANS 1 MINUTE
 
 # -------------------- Constants --------------------
-USER_DETAILS_SCHEDULES = ["00:00", "12:00", "16:31"]
-ENTITY_DETAILS_SCHEDULES = ["12:00", "12:05","16:31"]
+USER_DETAILS_SCHEDULES = ["00:00", "12:00", "19:14"]
+ENTITY_DETAILS_SCHEDULES = ["12:00", "12:00","19:14"]
+DEFAULT_INTERVAL_TYPE = "m"  # Options: 'h' = hourly, 'm' = minutely/monthly, 'd' = daily, 'y' = yearly
 
 # PG ADMIN CONNECTION CONFIGURATION
 PG_CONN_PARAMS = {
@@ -38,6 +41,12 @@ PG_CONN_PARAMS = {
     "user": "postgres",
     "password": "postgres"
 }
+
+# PRELOAD CONFIGURATIONS.
+PRELOAD_CONFIGS = [
+    ('2024-01-01 00:00:00', 0, 'task', 'mon', True),
+    ('2024-01-01 00:00:00', 0, 'inspection', 'y', True)
+]
 
 # POSTGRESQL TABLE NAME CONFIGURATIONS
 TASK_DETAILS_TABLE_NAME = "taskDetails"
@@ -140,7 +149,9 @@ def create_tables():
             id SERIAL PRIMARY KEY,
             synced_at TIMESTAMP,
             records_synced INTEGER,
-            sync_type TEXT
+            sync_type TEXT,
+            interval_type TEXT,
+            is_preload BOOLEAN DEFAULT FALSE
         );
     """).format(sql.Identifier(SYNC_TABLE)))
 
@@ -199,7 +210,7 @@ def get_last_sync_time(sync_type: str):
     cur = conn.cursor()
     cur.execute(
         f"""
-        SELECT synced_at FROM {SYNC_TABLE}
+        SELECT synced_at, interval_type, is_preload FROM {SYNC_TABLE}
         WHERE sync_type = %s
         ORDER BY synced_at DESC
         LIMIT 1;
@@ -209,23 +220,24 @@ def get_last_sync_time(sync_type: str):
     result = cur.fetchone()
     cur.close()
     conn.close()
+
     if result:
-        utc_time = result[0]  # this is in UTC
+        utc_time, interval_type, is_preload = result
         ist = pytz.timezone("Asia/Kolkata")
-        return utc_time.astimezone(ist)
+        return utc_time.astimezone(ist), interval_type, is_preload
     else:
         # fallback: current time minus 1 minute in IST
         ist = pytz.timezone("Asia/Kolkata")
-        return datetime.now(ist) - timedelta(seconds=CRON_TIME_IN_SECONDS)
+        return datetime.now(ist) - timedelta(seconds=60), 'h', True
 
 
-def insert_sync_record(timestamp, count, sync_type):
+def insert_sync_record(timestamp, count, sync_type,interval_type,is_preload):
     conn = psycopg2.connect(**PG_CONN_PARAMS)
     cur = conn.cursor()
     cur.execute(f"""
-        INSERT INTO {SYNC_TABLE} (synced_at, records_synced, sync_type)
-        VALUES (%s, %s, %s);
-    """, (timestamp, count, sync_type))
+        INSERT INTO {SYNC_TABLE} (synced_at, records_synced, sync_type, interval_type,is_preload)
+        VALUES (%s, %s, %s, %s,%s);
+    """, (timestamp, count, sync_type, interval_type,is_preload))
     conn.commit()
     cur.close()
     conn.close()
@@ -408,7 +420,7 @@ def sync_task_data():
     try:
         create_tables()  # Ensure tables exist
 
-        from_time = get_last_sync_time("task")
+        from_time, interval_type, is_preload = get_last_sync_time("task")
         to_time = datetime.now(pytz.timezone("Asia/Kolkata")).replace(tzinfo=None)
 
         from_str = from_time.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
@@ -416,7 +428,7 @@ def sync_task_data():
 
         all_rows = []
         columns = []
-        limit = 100
+        limit = 1000
         page = 0
         total = None
 
@@ -463,7 +475,7 @@ def sync_task_data():
 
         if count > 0:
             next_hour = get_next_hour_mark(to_time)
-            insert_sync_record(next_hour, count, "task")
+            insert_sync_record(next_hour, count, "task", interval_type, is_preload)
             logging.info(f"✅ Inserted sync_time record at {to_time} with {count} records.")
         else:
             logging.info("ℹ️ No new records synced. Skipping sync_time insertion.")
@@ -490,7 +502,7 @@ def sync_inspection_data():
     try:
         create_tables()
 
-        from_time = get_last_sync_time("inspection")
+        from_time, interval_type, is_preload = get_last_sync_time("inspection")
         to_time = datetime.now(pytz.timezone("Asia/Kolkata")).replace(tzinfo=None)
 
         from_str = from_time.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
@@ -498,7 +510,7 @@ def sync_inspection_data():
 
         all_rows = []
         columns = []
-        limit = 100
+        limit = 1000
         page = 0
         total = None
 
@@ -545,7 +557,7 @@ def sync_inspection_data():
 
         if count > 0:
             next_hour = get_next_hour_mark(to_time)
-            insert_sync_record(next_hour, count, "inspection")
+            insert_sync_record(next_hour, count, "inspection", interval_type, is_preload)
             logging.info(f"✅ Inserted sync_time record at {to_time} with {count} records.")
         else:
             logging.info("ℹ️ No new inspection records synced. Skipping sync_time insertion.")
@@ -565,6 +577,205 @@ def sync_inspection_data():
             "status": "error",
             "message": str(e)
         }), 500
+
+@app.route('/insertPreLoadTaskDetailsBulk', methods=['POST'])
+def sync_preload_task_data():
+    try:
+        create_tables()  # Ensure tables exist
+
+        from_time, interval_type, is_preload = get_last_sync_time("task")
+        now = datetime.now(pytz.timezone("Asia/Kolkata"))
+        
+        interval_seconds = get_seconds_from_interval_type(interval_type)
+        total_synced = 0
+
+        def get_next_interval(ft):
+            if interval_type == 'y':
+                return ft.replace(year=ft.year + 1)
+            elif interval_type == 'mon':
+                month = ft.month + 1
+                year = ft.year + month // 13
+                month = month % 12 or 12
+                return ft.replace(year=year, month=month)
+            elif interval_type == 'd':
+                return ft + timedelta(days=1)
+            elif interval_type == 'h':
+                return ft + timedelta(hours=1)
+            elif interval_type == 'm':
+                return ft + timedelta(minutes=1)
+            elif interval_type == 's':
+                return ft + timedelta(seconds=1)
+            else:
+                return ft + timedelta(seconds=interval_seconds)
+
+        while from_time < now:
+            to_time = min(get_next_interval(from_time), now)
+
+            from_str = from_time.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+            to_str = to_time.strftime("%Y-%m-%d %H:%M:%S")
+
+            all_rows = []
+            columns = []
+            limit = 1000
+            page = 0
+            total = None
+
+            while True:
+                payload = {
+                    "limit": limit,
+                    "offset": page,
+                    "fromTime": from_str,
+                    "toTime": to_str
+                }
+                headers = {WEB_API_KEY_NAME: WEB_VALID_API_KEY}
+
+                logging.info(f"📄 Fetching TASK page {page+1} | Interval: {from_str} to {to_str}")
+                try:
+                    response = requests.post(WEB_API_TASK, json=payload, headers=headers, timeout=360)
+                    response.raise_for_status()
+                    data = response.json()
+                except Exception as e:
+                    logging.error(f"❌ TASK fetch failed for interval {from_str}–{to_str}: {e}")
+                    return jsonify({
+                        "status": "error",
+                        "message": f"Task fetch error: {str(e)}"
+                    }), 500
+
+                records = data.get("Data", [])
+                total = data.get("TotalRecordCount", 0) if total is None else total
+
+                if not records:
+                    break
+
+                if not columns:
+                    columns = list(records[0].keys())
+
+                all_rows.extend([tuple(row.get(col) for col in columns) for row in records])
+                page += 1
+                if len(all_rows) >= total:
+                    break
+
+            if all_rows:
+                inserted_count = insert_into_postgres(columns, all_rows)
+                current_now = datetime.now(pytz.timezone("Asia/Kolkata")).replace(tzinfo=None)
+                insert_sync_record(current_now, inserted_count, "task", interval_type, is_preload)
+                total_synced += inserted_count
+                logging.info(f"✅ TASK: Synced {inserted_count} records from {from_str} to {to_str}")
+            else:
+                logging.info(f"ℹ️ TASK: No records from {from_str} to {to_str}")
+
+            from_time = to_time
+
+        if is_preload:
+            mark_preload_completed("task")
+
+        return jsonify({
+            "status": "success",
+            "message": f"Total task records synced: {total_synced}"
+        }), 200
+
+    except Exception as e:
+        logging.error(f"❌ Task sync failed: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 50
+    
+@app.route('/insertPreLoadInspectionDetailsBulk', methods=['POST'])
+def sync_preload_inspection_data():
+    try:
+        create_tables()
+
+        from_time, interval_type, is_preload = get_last_sync_time("inspection")
+        now = datetime.now(pytz.timezone("Asia/Kolkata"))
+        interval_seconds = get_seconds_from_interval_type(interval_type)
+        total_synced = 0
+
+        def get_next_interval(ft):
+            if interval_type == 'y':
+                return ft.replace(year=ft.year + 1)
+            elif interval_type == 'mon':
+                month = ft.month + 1
+                year = ft.year + month // 13
+                month = month % 12 or 12
+                return ft.replace(year=year, month=month)
+            elif interval_type == 'd':
+                return ft + timedelta(days=1)
+            elif interval_type == 'h':
+                return ft + timedelta(hours=1)
+            elif interval_type == 'm':
+                return ft + timedelta(minutes=1)
+            elif interval_type == 's':
+                return ft + timedelta(seconds=1)
+            else:
+                return ft + timedelta(seconds=interval_seconds)
+
+        while from_time < now:
+            to_time = min(get_next_interval(from_time), now)
+
+            from_str = from_time.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+            to_str = to_time.strftime("%Y-%m-%d %H:%M:%S")
+
+            all_rows = []
+            columns = []
+            limit = 1000
+            page = 0
+            total = None
+
+            while True:
+                payload = {
+                    "limit": limit,
+                    "offset": page,
+                    "fromTime": from_str,
+                    "toTime": to_str
+                }
+                headers = {WEB_API_KEY_NAME: WEB_VALID_API_KEY}
+                logging.info(f"📄 Fetching INSPECTION page {page + 1} | Interval: {from_str} to {to_str}")
+
+                try:
+                    response = requests.post(WEB_API_INSPECTION, json=payload, headers=headers, timeout=360)
+                    response.raise_for_status()
+                    data = response.json()
+                except Exception as e:
+                    logging.error(f"❌ INSPECTION fetch failed for {from_str}–{to_str}: {e}")
+                    return jsonify({
+                        "status": "error",
+                        "message": f"Inspection fetch error: {str(e)}"
+                    }), 500
+
+                records = data.get("Data", [])
+                total = data.get("TotalRecordCount", 0) if total is None else total
+
+                if not records:
+                    break
+
+                if not columns:
+                    columns = list(records[0].keys())
+
+                all_rows.extend([tuple(row.get(col) for col in columns) for row in records])
+                page += 1
+                if len(all_rows) >= total:
+                    break
+
+            if all_rows:
+                inserted_count = insert_inspection_data(columns, all_rows)
+                current_now = datetime.now(pytz.timezone("Asia/Kolkata")).replace(tzinfo=None)
+                insert_sync_record(current_now, inserted_count, "inspection", interval_type, is_preload)
+                total_synced += inserted_count
+                logging.info(f"✅ INSPECTION: Synced {inserted_count} from {from_str} to {to_str}")
+            else:
+                logging.info(f"ℹ️ INSPECTION: No records from {from_str} to {to_str}")
+
+            from_time = to_time
+
+        if is_preload:
+            mark_preload_completed("inspection")
+
+        return jsonify({
+            "status": "success",
+            "message": f"Total inspection records synced: {total_synced}"
+        }), 200
+
+    except Exception as e:
+        logging.error(f"❌ Task sync failed: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 50
 
 @app.route('/insertUserDetailsBulk', methods=['POST'])
 def insert_user_details_bulk():
@@ -613,7 +824,7 @@ def insert_user_details_bulk():
         
         if count > 0:
             current_hour = get_current_hour_mark()
-            insert_sync_record(current_hour, count, "user")
+            insert_sync_record(current_hour, count, "user",DEFAULT_INTERVAL_TYPE,is_preload=True)
             logging.info(f"✅ Inserted sync_time record at {current_hour} with {count} records.")
         else:
             logging.info("ℹ️ No new user records synced. Skipping sync_time insertion.")
@@ -640,7 +851,7 @@ def insert_entity_details_bulk():
 
         all_rows = []
         columns = []
-        limit = 100  # recommended value for performance
+        limit = 1000  # recommended value for performance
         page = 0
         total = None
 
@@ -679,7 +890,7 @@ def insert_entity_details_bulk():
         count = insert_entity_details(columns, all_rows)
         if count > 0:
             current_hour = get_current_hour_mark()
-            insert_sync_record(current_hour, count, "entity")
+            insert_sync_record(current_hour, count, "entity",DEFAULT_INTERVAL_TYPE,is_preload=True)
             logging.info(f"✅ Inserted sync_time record at {current_hour} with {count} records.")
         else:
             logging.info("ℹ️ No new entity records synced. Skipping sync_time insertion.")
@@ -757,27 +968,185 @@ def schedule_sync_jobs():
     while True:
         schedule.run_pending()
         time.sleep(60)
+
+def get_seconds_from_interval_type(interval_type: str) -> int:
+    """
+    Converts interval type to seconds.
+    's'   = second
+    'm'   = minute
+    'h'   = hour
+    'd'   = day
+    'mon' = month (approximated as 30 days)
+    'y'   = year (approximated as 365 days)
+    """
+    interval_type = interval_type.lower()
+
+    if interval_type == "s":
+        return 1
+    elif interval_type == "m":
+        return 60
+    elif interval_type == "h":
+        return 3600
+    elif interval_type == "d":
+        return 86400
+    elif interval_type == "mon":
+        return 2592000  # 30 * 24 * 60 * 60
+    elif interval_type == "y":
+        return 31536000  # 365 * 24 * 60 * 60
+    else:
+        # Fallback: return 60 seconds (1 minute)
+        logging.warning(f"Unknown interval_type '{interval_type}', defaulting to 60 seconds")
+        return 60
+
+def mark_preload_completed(sync_type: str):
+    try:
+        conn = psycopg2.connect(**PG_CONN_PARAMS)
+        cur = conn.cursor()
+        cur.execute(f"""
+            UPDATE {SYNC_TABLE}
+            SET is_preload = FALSE,
+                interval_type = %s
+            WHERE id = (
+                SELECT id FROM {SYNC_TABLE}
+                WHERE sync_type = %s AND is_preload = TRUE
+                ORDER BY synced_at DESC
+                LIMIT 1
+            );
+        """, (DEFAULT_INTERVAL_TYPE, sync_type))
+        updated = cur.rowcount
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        if updated:
+            logging.info(f"[{sync_type}] Preload flag cleared and interval_type set to '{DEFAULT_INTERVAL_TYPE}'.")
+        else:
+            logging.info(f"[{sync_type}] No preload records found to update.")
+    except Exception as e:
+        logging.error(f"Error in mark_preload_completed for '{sync_type}': {e}")
+
 # -------------------- Background Thread for Auto Sync --------------------
-def auto_sync_loop():
+def preload_config():
+    try:
+        conn = psycopg2.connect(**PG_CONN_PARAMS)
+        cur = conn.cursor()
+
+        for record in PRELOAD_CONFIGS:
+            _, _, sync_type, _, _ = record
+
+            # Check if sync_type already exists
+            cur.execute(f"SELECT 1 FROM {SYNC_TABLE} WHERE sync_type = %s LIMIT 1", (sync_type,))
+            if cur.fetchone():
+                logging.info(f"ℹ️ Record for '{sync_type}' already exists. Skipping insert.")
+                continue
+
+            # Insert if not found
+            cur.execute(f"""
+                INSERT INTO {SYNC_TABLE} (synced_at, records_synced, sync_type, interval_type, is_preload)
+                VALUES (%s, %s, %s, %s, %s)
+            """, record)
+            logging.info(f"✅ Preload config inserted for '{sync_type}'.")
+
+        conn.commit()
+
+    except Exception as e:
+        logging.error(f"❌ Failed to insert preload configuration: {e}")
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
+            
+def task_auto_sync_loop():
     time.sleep(5)  # Wait for Flask to start
     while True:
         try:
             res = requests.post(LOCAL_TASK_API, timeout=3600)
-            logging.info(f"Auto sync triggered. Status: {res.status_code}")
-               # Call /insertInspectionDetailsBulk
+            logging.info(f"[Auto Sync] Task triggered - Status: {res.status_code}")
+        except Exception as e:
+            logging.error(f"[Auto Sync] Task error: {e}")
+        time.sleep(CRON_TIME_IN_SECONDS)
+
+
+def inspection_auto_sync_loop():
+    time.sleep(5)  # Wait for Flask to start
+    while True:
+        try:
             inspection_res = requests.post(LOCAL_INSPECTION_API, timeout=3600)
             logging.info(f"[Auto Sync] {INSPECTION_DETAILS_TABLE_NAME} triggered - Status: {inspection_res.status_code}")
         except Exception as e:
-            logging.error(f"Auto sync error: {e}")
+            logging.error(f"[Auto Sync] Inspection error: {e}")
         time.sleep(CRON_TIME_IN_SECONDS)
+
+
+def task_run_preload():
+    try:
+        logging.info("🚀 Starting task preload...")
+
+        if is_task_preload:
+            task_preload_res = requests.post(LOCAL_PRELOAD_TASK_API, timeout=3600)
+            logging.info(f"[Preload] Task API triggered - Status: {task_preload_res.status_code}")
+            if task_preload_res.status_code == 200:
+                mark_preload_completed("task")
+                logging.info("✅ Task preload completed.")
+            else:
+                logging.warning("⚠️ Task preload failed.")
+
+        logging.info("🎯 Starting task auto sync...")
+        threading.Thread(target=task_auto_sync_loop, daemon=True).start()
+
+    except Exception as e:
+        logging.error(f"❌ Task preload error: {e}")
+
+
+def inspection_run_preload():
+    try:
+        logging.info("🚀 Starting inspection preload...")
+
+        if is_inspection_preload:
+            inspection_preload_res = requests.post(LOCAL_PRELOAD_INSPECTION_API, timeout=3600)
+            logging.info(f"[Preload] Inspection API triggered - Status: {inspection_preload_res.status_code}")
+            if inspection_preload_res.status_code == 200:
+                mark_preload_completed("inspection")
+                logging.info("✅ Inspection preload completed.")
+            else:
+                logging.warning("⚠️ Inspection preload failed.")
+
+        logging.info("🎯 Starting inspection auto sync...")
+        threading.Thread(target=inspection_auto_sync_loop, daemon=True).start()
+
+    except Exception as e:
+        logging.error(f"❌ Inspection preload error: {e}")
+
 
 # -------------------- Start Server --------------------
 
 def start_flask_app():
     app.run(port=PORT, debug=True, use_reloader=False)  # Disable reloader to avoid duplicate threads
 
+
 if __name__ == '__main__':
-    # Only run threads if this is the main process
-    threading.Thread(target=auto_sync_loop, daemon=True).start()
+    create_tables()
+    preload_config()
+    _, _, is_task_preload = get_last_sync_time("task")
+    _, _, is_inspection_preload = get_last_sync_time("inspection")
+
+    # ✅ Task Preload or Auto Sync
+    if is_task_preload:
+        logging.info("⏳ Task preload required. Sync will start after preload.")
+        threading.Thread(target=task_run_preload, daemon=True).start()
+    else:
+       logging.info("🎯 Starting Task auto sync...")
+       threading.Thread(target=task_auto_sync_loop, daemon=True).start()
+
+    # ✅ Inspection Preload or Auto Sync
+    if is_inspection_preload:
+        logging.info("⏳ Inspection preload required. Sync will start after preload.")
+        threading.Thread(target=inspection_run_preload, daemon=True).start()
+    else:
+        logging.info("🎯 Starting inspection auto sync...")
+        threading.Thread(target=inspection_auto_sync_loop, daemon=True).start()
+
     threading.Thread(target=schedule_sync_jobs, daemon=True).start()
-    threading.Thread(target=start_flask_app, daemon=False).start()  # Flask runs i
+    start_flask_app()  # No need to start Flask in thread unless required
+
