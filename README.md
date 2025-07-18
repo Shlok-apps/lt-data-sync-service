@@ -85,3 +85,7 @@ PRELOAD_CONFIGS = [
     ('2024-01-01 00:00:00', 0, 'task', 'mon', True),
     ('2024-01-01 00:00:00', 0, 'inspection', 'y', True)
 ]
+
+
+# INTALL DEPENDICES
+pip install -r requirements.txt
